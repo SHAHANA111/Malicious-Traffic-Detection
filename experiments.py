@@ -1,0 +1,166 @@
+import time
+import warnings
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler, LabelEncoder, label_binarize
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+from skrebate import ReliefF
+
+warnings.filterwarnings("ignore")
+
+# ---------------- CONFIG ----------------
+SEEDS = [42, 7, 21, 99, 123]
+TUNE_SEED = 42
+N_SAMPLE = 20000
+N_FEATURES = 10
+RELIEF_SAMPLE = 3000
+SMOTE_K = 3
+
+df = pd.read_csv("cleaned_data/cleaned_CICIDS2017.csv")
+print("Loaded:", df.shape)
+
+
+def prepare(seed):
+    """Subsample -> split -> scale -> Relief. Everything fitted on train only."""
+    sample, _ = train_test_split(
+        df,
+        train_size=N_SAMPLE,
+        stratify=df["Class"],
+        random_state=seed
+    )
+
+    X = sample.drop(columns=["Label", "Class", "Source_File"])
+    le = LabelEncoder()
+    y = le.fit_transform(sample["Class"])
+    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.3, stratify=y, random_state=seed)
+
+    keep = X_tr.columns[X_tr.nunique() > 1]
+    X_tr, X_te = X_tr[keep], X_te[keep]
+
+    sc = StandardScaler()
+    X_tr_s = pd.DataFrame(sc.fit_transform(X_tr), columns=keep, index=X_tr.index)
+    X_te_s = pd.DataFrame(sc.transform(X_te), columns=keep, index=X_te.index)
+
+    Xr, _, yr, _ = train_test_split(X_tr_s, y_tr, train_size=RELIEF_SAMPLE,
+                                    stratify=y_tr, random_state=seed)
+    relief = ReliefF(n_features_to_select=N_FEATURES, n_neighbors=10, n_jobs=-1)
+    relief.fit(Xr.values, yr)
+    ranking = pd.Series(relief.feature_importances_, index=keep).sort_values(ascending=False)
+    sel = list(ranking.index[:N_FEATURES])
+    return X_tr_s[sel], X_te_s[sel], y_tr, y_te, sel, list(le.classes_)
+
+
+# ---------------- 1. SVM TUNING (training data of TUNE_SEED only; SMOTE inside CV) ----------------
+print("\n=== SVM TUNING ===")
+X_tr, X_te, y_tr, y_te, sel, class_names = prepare(TUNE_SEED)
+grid = {"svm__C": [1, 10, 100], "svm__gamma": ["scale", 0.01, 0.1]}
+best, tuning_rows = {}, []
+
+for key, kw in [("rbf", dict(kernel="rbf")), ("poly", dict(kernel="poly", degree=2, coef0=1))]:
+    t0 = time.time()
+    pipe = ImbPipeline([("smote", SMOTE(k_neighbors=SMOTE_K, random_state=TUNE_SEED)),
+                        ("svm", SVC(class_weight="balanced", **kw))])
+    gs = GridSearchCV(pipe, grid, scoring="f1_macro", cv=3, n_jobs=-1)
+    gs.fit(X_tr, y_tr)
+    best[key] = {"C": gs.best_params_["svm__C"], "gamma": gs.best_params_["svm__gamma"]}
+    for p, s in zip(gs.cv_results_["params"], gs.cv_results_["mean_test_score"]):
+        tuning_rows.append({"Kernel": key, "C": p["svm__C"], "gamma": p["svm__gamma"],
+                            "CV_F1_macro": round(s, 4)})
+    print(f"{key}: best={best[key]} (CV macro-F1={gs.best_score_:.4f}) in {time.time()-t0:.0f}s")
+
+pd.DataFrame(tuning_rows).to_csv("outputs/tuning_results.csv", index=False)
+
+
+# ---------------- 2. MODEL BUILDER ----------------
+def build_models(strategy, seed):
+    cw = None if strategy == "None" else "balanced"
+    m = {}
+    if strategy != "ClassWeight":          # KNN has no class_weight: ClassWeight == None for KNN
+        m["KNN (k=7)"] = KNeighborsClassifier(n_neighbors=7, metric="manhattan",
+                                              weights="distance", n_jobs=-1)
+    m["Decision Tree"] = DecisionTreeClassifier(criterion="entropy", max_depth=7,
+                                                min_samples_split=10, min_samples_leaf=5,
+                                                class_weight=cw, random_state=seed)
+    if strategy == "SMOTE":
+        m["SVM-RBF (paper)"] = SVC(kernel="rbf", C=100, gamma="scale", class_weight=cw)
+        m["SVM-Poly (paper)"] = SVC(kernel="poly", degree=2, C=10, gamma=0.01, coef0=1, class_weight=cw)
+    m["SVM-RBF (tuned)"] = SVC(kernel="rbf", class_weight=cw, **best["rbf"])
+    m["SVM-Poly (tuned)"] = SVC(kernel="poly", degree=2, coef0=1, class_weight=cw, **best["poly"])
+    return m
+
+
+# ---------------- 3. MULTI-SEED EXPERIMENTS ----------------
+rows, relief_counts = [], {}
+
+for seed in SEEDS:
+    print(f"\n=== SEED {seed} ===")
+    X_tr, X_te, y_tr, y_te, sel, class_names = prepare(seed)
+    for f in sel:
+        relief_counts[f] = relief_counts.get(f, 0) + 1
+
+    labels = list(range(len(class_names)))
+    y_bin = label_binarize(y_te, classes=labels)
+    support = y_bin.sum(axis=0)
+    oa = class_names.index("Other_Attacks")
+    print("Test counts:", dict(zip(class_names, support)))
+
+    for strategy in ["SMOTE", "ClassWeight", "None"]:
+        if strategy == "SMOTE":
+            Xf, yf = SMOTE(k_neighbors=SMOTE_K, random_state=seed).fit_resample(X_tr, y_tr)
+        else:
+            Xf, yf = X_tr, y_tr
+
+        for name, model in build_models(strategy, seed).items():
+            t0 = time.time()
+            model.fit(Xf, yf)
+            fit_time = time.time() - t0
+
+            y_pred = model.predict(X_te)
+            scores = model.predict_proba(X_te) if hasattr(model, "predict_proba") \
+                else model.decision_function(X_te)
+            aucs = [roc_auc_score(y_bin[:, i], scores[:, i]) for i in labels]
+            p, r, f1, _ = precision_recall_fscore_support(y_te, y_pred, labels=labels, zero_division=0)
+            _, _, f1_macro, _ = precision_recall_fscore_support(y_te, y_pred, average="macro",
+                                                                zero_division=0)
+            rows.append({
+                "Seed": seed, "Strategy": strategy, "Model": name,
+                "Accuracy": accuracy_score(y_te, y_pred), "F1_macro": f1_macro,
+                "AUC_weighted": np.average(aucs, weights=support), "AUC_macro": np.mean(aucs),
+                "OA_Precision": p[oa], "OA_Recall": r[oa], "OA_F1": f1[oa],
+                "Fit_time_s": round(fit_time, 1),
+            })
+            print(f"  [{strategy:11s}] {name:17s} acc={rows[-1]['Accuracy']:.4f} "
+                  f"AUCw={rows[-1]['AUC_weighted']:.4f} OA_F1={f1[oa]:.3f} ({fit_time:.1f}s)")
+
+# ---------------- 4. SUMMARIES ----------------
+res = pd.DataFrame(rows)
+res.to_csv("outputs/multiseed_runs.csv", index=False)
+
+metrics = ["Accuracy", "F1_macro", "AUC_weighted", "AUC_macro", "OA_Precision", "OA_Recall", "OA_F1"]
+g = res.groupby(["Strategy", "Model"])[metrics]
+summary = g.mean().round(3).astype(str) + " ± " + g.std().round(3).astype(str)
+summary.to_csv("outputs/multiseed_summary.csv")
+print("\n=== MEAN ± STD OVER", len(SEEDS), "SEEDS (OA = Other_Attacks) ===")
+print(summary.to_string())
+
+core = ["KNN (k=7)", "Decision Tree", "SVM-RBF (tuned)", "SVM-Poly (tuned)"]
+r = res[(res.Strategy == "SMOTE") & res.Model.isin(core)].copy()
+r["rank_AUC_weighted"] = r.groupby("Seed")["AUC_weighted"].rank(ascending=False)
+r["rank_AUC_macro"] = r.groupby("Seed")["AUC_macro"].rank(ascending=False)
+print("\n=== MEAN RANK (1 = best), SMOTE, tuned SVMs ===")
+print(r.groupby("Model")[["rank_AUC_weighted", "rank_AUC_macro"]].mean().round(2))
+diff = sum(list(s.sort_values("AUC_weighted", ascending=False).Model) !=
+           list(s.sort_values("AUC_macro", ascending=False).Model) for _, s in r.groupby("Seed"))
+print(f"Seeds where weighted vs macro AUC ordering differs: {diff}/{len(SEEDS)}")
+
+stab = pd.Series(relief_counts).sort_values(ascending=False)
+stab.to_csv("outputs/relief_stability.csv", header=["times_selected"])
+print(f"\n=== RELIEF FEATURE STABILITY (times in top {N_FEATURES}, out of {len(SEEDS)} seeds) ===")
+print(stab.to_string())
+print("\nSaved: multiseed_runs.csv, multiseed_summary.csv, tuning_results.csv, relief_stability.csv")
