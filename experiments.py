@@ -11,8 +11,11 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline as ImbPipeline
 from skrebate import ReliefF
+from pathlib import Path
+from sklearn.feature_selection import VarianceThreshold
 
-warnings.filterwarnings("ignore")
+
+Path("outputs").mkdir(exist_ok=True)
 
 # ---------------- CONFIG ----------------
 SEEDS = [42, 7, 21, 99, 123]
@@ -35,114 +38,323 @@ def prepare(seed):
         random_state=seed
     )
 
-    X = sample.drop(columns=["Label", "Class", "Source_File"])
+    X = sample.drop(columns=[
+    "Label",
+    "Class",
+    "Source_File",
+    "Fwd Header Length.1"
+])
     le = LabelEncoder()
     y = le.fit_transform(sample["Class"])
     X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.3, stratify=y, random_state=seed)
 
-    keep = X_tr.columns[X_tr.nunique() > 1]
-    X_tr, X_te = X_tr[keep], X_te[keep]
-
-    sc = StandardScaler()
-    X_tr_s = pd.DataFrame(sc.fit_transform(X_tr), columns=keep, index=X_tr.index)
-    X_te_s = pd.DataFrame(sc.transform(X_te), columns=keep, index=X_te.index)
-
-    Xr, _, yr, _ = train_test_split(X_tr_s, y_tr, train_size=RELIEF_SAMPLE,
-                                    stratify=y_tr, random_state=seed)
-    relief = ReliefF(n_features_to_select=N_FEATURES, n_neighbors=10, n_jobs=-1)
-    relief.fit(Xr.values, yr)
-    ranking = pd.Series(relief.feature_importances_, index=keep).sort_values(ascending=False)
-    sel = list(ranking.index[:N_FEATURES])
-    return X_tr_s[sel], X_te_s[sel], y_tr, y_te, sel, list(le.classes_)
+    return X_tr, X_te, y_tr, y_te, list(X_tr.columns), list(le.classes_)
 
 
 # ---------------- 1. SVM TUNING (training data of TUNE_SEED only; SMOTE inside CV) ----------------
+
 print("\n=== SVM TUNING ===")
+
 X_tr, X_te, y_tr, y_te, sel, class_names = prepare(TUNE_SEED)
-grid = {"svm__C": [1, 10, 100], "svm__gamma": ["scale", 0.01, 0.1]}
-best, tuning_rows = {}, []
 
-for key, kw in [("rbf", dict(kernel="rbf")), ("poly", dict(kernel="poly", degree=2, coef0=1))]:
+grid = {
+    "relief__n_features_to_select": [N_FEATURES],
+    "svm__C": [1, 10, 100],
+    "svm__gamma": ["scale", 0.01, 0.1]
+}
+
+best = {}
+tuning_rows = []
+
+for key, kw in [
+    ("rbf", dict(kernel="rbf")),
+    ("poly", dict(kernel="poly", degree=2, coef0=1))
+]:
+
     t0 = time.time()
-    pipe = ImbPipeline([("smote", SMOTE(k_neighbors=SMOTE_K, random_state=TUNE_SEED)),
-                        ("svm", SVC(class_weight="balanced", **kw))])
-    gs = GridSearchCV(pipe, grid, scoring="f1_macro", cv=3, n_jobs=-1)
-    gs.fit(X_tr, y_tr)
-    best[key] = {"C": gs.best_params_["svm__C"], "gamma": gs.best_params_["svm__gamma"]}
-    for p, s in zip(gs.cv_results_["params"], gs.cv_results_["mean_test_score"]):
-        tuning_rows.append({"Kernel": key, "C": p["svm__C"], "gamma": p["svm__gamma"],
-                            "CV_F1_macro": round(s, 4)})
-    print(f"{key}: best={best[key]} (CV macro-F1={gs.best_score_:.4f}) in {time.time()-t0:.0f}s")
 
-pd.DataFrame(tuning_rows).to_csv("outputs/tuning_results.csv", index=False)
+    pipe = ImbPipeline([
+    ("scaler", StandardScaler()),
+    ("variance", VarianceThreshold()),
+    ("relief", ReliefF(
+        n_features_to_select=N_FEATURES,
+        n_neighbors=10,
+        n_jobs=-1
+    )),
+    ("smote", SMOTE(
+        k_neighbors=SMOTE_K,
+        random_state=TUNE_SEED
+    )),
+    ("svm", SVC(**kw))
+])
+
+    gs = GridSearchCV(
+        pipe,
+        grid,
+        scoring="f1_macro",
+        cv=3,
+        n_jobs=-1
+    )
+
+    gs.fit(X_tr, y_tr)
+
+    best[key] = {
+        "C": gs.best_params_["svm__C"],
+        "gamma": gs.best_params_["svm__gamma"]
+    }
+
+    for p, s in zip(
+        gs.cv_results_["params"],
+        gs.cv_results_["mean_test_score"]
+    ):
+        tuning_rows.append({
+            "Kernel": key,
+            "C": p["svm__C"],
+            "gamma": p["svm__gamma"],
+            "CV_F1_macro": round(s, 4)
+        })
+
+    print(
+        f"{key}: best={best[key]} "
+        f"(CV macro-F1={gs.best_score_:.4f}) "
+        f"in {time.time()-t0:.0f}s"
+    )
+
+pd.DataFrame(tuning_rows).to_csv(
+    "outputs/tuning_results.csv",
+    index=False
+)
+
 
 
 # ---------------- 2. MODEL BUILDER ----------------
+
 def build_models(strategy, seed):
-    cw = None if strategy == "None" else "balanced"
+
+    # Apply class weights ONLY for the ClassWeight strategy
+    cw = "balanced" if strategy == "ClassWeight" else None
+
     m = {}
-    if strategy != "ClassWeight":          # KNN has no class_weight: ClassWeight == None for KNN
-        m["KNN (k=7)"] = KNeighborsClassifier(n_neighbors=7, metric="manhattan",
-                                              weights="distance", n_jobs=-1)
-    m["Decision Tree"] = DecisionTreeClassifier(criterion="entropy", max_depth=7,
-                                                min_samples_split=10, min_samples_leaf=5,
-                                                class_weight=cw, random_state=seed)
+
+    # KNN does not support class_weight
+    if strategy != "ClassWeight":
+        m["KNN (k=7)"] = KNeighborsClassifier(
+            n_neighbors=7,
+            metric="manhattan",
+            weights="distance",
+            n_jobs=-1
+        )
+
+    m["Decision Tree"] = DecisionTreeClassifier(
+        criterion="entropy",
+        max_depth=7,
+        min_samples_split=10,
+        min_samples_leaf=5,
+        class_weight=cw,
+        random_state=seed
+    )
+
+    # Original paper hyperparameters: evaluate under SMOTE
     if strategy == "SMOTE":
-        m["SVM-RBF (paper)"] = SVC(kernel="rbf", C=100, gamma="scale", class_weight=cw)
-        m["SVM-Poly (paper)"] = SVC(kernel="poly", degree=2, C=10, gamma=0.01, coef0=1, class_weight=cw)
-    m["SVM-RBF (tuned)"] = SVC(kernel="rbf", class_weight=cw, **best["rbf"])
-    m["SVM-Poly (tuned)"] = SVC(kernel="poly", degree=2, coef0=1, class_weight=cw, **best["poly"])
+        m["SVM-RBF (paper)"] = SVC(
+            kernel="rbf",
+            C=100,
+            gamma="scale"
+        )
+
+        m["SVM-Poly (paper)"] = SVC(
+            kernel="poly",
+            degree=2,
+            C=10,
+            gamma=0.01,
+            coef0=1
+        )
+
+    # Tuned SVMs: evaluate under all applicable strategies
+    m["SVM-RBF (tuned)"] = SVC(
+        kernel="rbf",
+        **best["rbf"],
+        class_weight=cw
+    )
+
+    m["SVM-Poly (tuned)"] = SVC(
+        kernel="poly",
+        degree=2,
+        coef0=1,
+        **best["poly"],
+        class_weight=cw
+    )
+
     return m
+
+def build_preprocessor():
+    return ImbPipeline([
+        ("scaler", StandardScaler()),
+        ("variance", VarianceThreshold()),
+        ("relief", ReliefF(
+            n_features_to_select=N_FEATURES,
+            n_neighbors=10,
+            n_jobs=-1
+        ))
+    ])
+
 
 
 # ---------------- 3. MULTI-SEED EXPERIMENTS ----------------
-rows, relief_counts = [], {}
+
+# ---------------- 3. MULTI-SEED EXPERIMENTS ----------------
+
+rows = []
+relief_counts = {}
 
 for seed in SEEDS:
     print(f"\n=== SEED {seed} ===")
-    X_tr, X_te, y_tr, y_te, sel, class_names = prepare(seed)
-    for f in sel:
-        relief_counts[f] = relief_counts.get(f, 0) + 1
+
+    X_tr, X_te, y_tr, y_te, _, class_names = prepare(seed)
 
     labels = list(range(len(class_names)))
     y_bin = label_binarize(y_te, classes=labels)
     support = y_bin.sum(axis=0)
     oa = class_names.index("Other_Attacks")
+
     print("Test counts:", dict(zip(class_names, support)))
 
-    for strategy in ["SMOTE", "ClassWeight", "None"]:
-        if strategy == "SMOTE":
-            Xf, yf = SMOTE(k_neighbors=SMOTE_K, random_state=seed).fit_resample(X_tr, y_tr)
-        else:
-            Xf, yf = X_tr, y_tr
+    selected_features_recorded = False
 
-        for name, model in build_models(strategy, seed).items():
+    for strategy in ["SMOTE", "ClassWeight", "None"]:
+
+        models = build_models(strategy, seed)
+
+        for name, model in models.items():
+
+            # Apply SMOTE only for the SMOTE strategy
+            sampler = (
+                SMOTE(k_neighbors=SMOTE_K, random_state=seed)
+                if strategy == "SMOTE"
+                else "passthrough"
+            )
+
+            # Complete preprocessing and model pipeline
+            pipeline = ImbPipeline([
+                ("preprocess", build_preprocessor()),
+                ("smote", sampler),
+                ("model", model)
+            ])
+
             t0 = time.time()
-            model.fit(Xf, yf)
+
+            pipeline.fit(X_tr, y_tr)
+
             fit_time = time.time() - t0
 
-            y_pred = model.predict(X_te)
-            scores = model.predict_proba(X_te) if hasattr(model, "predict_proba") \
-                else model.decision_function(X_te)
-            aucs = [roc_auc_score(y_bin[:, i], scores[:, i]) for i in labels]
-            p, r, f1, _ = precision_recall_fscore_support(y_te, y_pred, labels=labels, zero_division=0)
-            _, _, f1_macro, _ = precision_recall_fscore_support(y_te, y_pred, average="macro",
-                                                                zero_division=0)
+            y_pred = pipeline.predict(X_te)
+
+            if hasattr(pipeline, "predict_proba"):
+                scores = pipeline.predict_proba(X_te)
+            else:
+                scores = pipeline.decision_function(X_te)
+
+            aucs = [
+                roc_auc_score(y_bin[:, i], scores[:, i])
+                for i in labels
+            ]
+
+            # Class-wise metrics
+            p, r, f1, _ = precision_recall_fscore_support(
+                y_te,
+                y_pred,
+                labels=labels,
+                zero_division=0
+            )
+
+            # Macro metrics
+            _, _, f1_macro, _ = precision_recall_fscore_support(
+                y_te,
+                y_pred,
+                average="macro",
+                zero_division=0
+            )
+
+            # Weighted metrics
+            p_weighted, r_weighted, f1_weighted, _ = (
+                precision_recall_fscore_support(
+                    y_te,
+                    y_pred,
+                    average="weighted",
+                    zero_division=0
+                )
+            )
+
             rows.append({
-                "Seed": seed, "Strategy": strategy, "Model": name,
-                "Accuracy": accuracy_score(y_te, y_pred), "F1_macro": f1_macro,
-                "AUC_weighted": np.average(aucs, weights=support), "AUC_macro": np.mean(aucs),
-                "OA_Precision": p[oa], "OA_Recall": r[oa], "OA_F1": f1[oa],
-                "Fit_time_s": round(fit_time, 1),
+                "Seed": seed,
+                "Strategy": strategy,
+                "Model": name,
+                "Accuracy": accuracy_score(y_te, y_pred),
+                "Precision_weighted": p_weighted,
+                "Recall_weighted": r_weighted,
+                "F1_weighted": f1_weighted,
+                "F1_macro": f1_macro,
+                "AUC_weighted": np.average(aucs, weights=support),
+                "AUC_macro": np.mean(aucs),
+                "OA_Precision": p[oa],
+                "OA_Recall": r[oa],
+                "OA_F1": f1[oa],
+                "Fit_time_s": round(fit_time, 1)
             })
-            print(f"  [{strategy:11s}] {name:17s} acc={rows[-1]['Accuracy']:.4f} "
-                  f"AUCw={rows[-1]['AUC_weighted']:.4f} OA_F1={f1[oa]:.3f} ({fit_time:.1f}s)")
+
+            # Record ReliefF-selected features once per seed
+            if not selected_features_recorded:
+
+                prep = pipeline.named_steps["preprocess"]
+
+                variance = prep.named_steps["variance"]
+                relief = prep.named_steps["relief"]
+
+                remaining_features = X_tr.columns[
+                    variance.get_support()
+                ]
+
+                ranking = pd.Series(
+                    relief.feature_importances_,
+                    index=remaining_features
+                ).sort_values(ascending=False)
+
+                for feature in ranking.index[:N_FEATURES]:
+                    relief_counts[feature] = (
+                        relief_counts.get(feature, 0) + 1
+                    )
+
+                selected_features_recorded = True
+
+            print(
+                f"  [{strategy:11s}] {name:17s} "
+                f"acc={rows[-1]['Accuracy']:.4f} "
+                f"AUCw={rows[-1]['AUC_weighted']:.4f} "
+                f"OA_F1={f1[oa]:.3f} "
+                f"({fit_time:.1f}s)"
+            )
+
+# ---------------- SAVE RESULTS ----------------
+
+res = pd.DataFrame(rows)
+res.to_csv("outputs/multiseed_runs.csv", index=False)
 
 # ---------------- 4. SUMMARIES ----------------
 res = pd.DataFrame(rows)
 res.to_csv("outputs/multiseed_runs.csv", index=False)
 
-metrics = ["Accuracy", "F1_macro", "AUC_weighted", "AUC_macro", "OA_Precision", "OA_Recall", "OA_F1"]
+metrics = [
+    "Accuracy",
+    "Precision_weighted",
+    "Recall_weighted",
+    "F1_weighted",
+    "F1_macro",
+    "AUC_weighted",
+    "AUC_macro",
+    "OA_Precision",
+    "OA_Recall",
+    "OA_F1"
+]
 g = res.groupby(["Strategy", "Model"])[metrics]
 summary = g.mean().round(3).astype(str) + " ± " + g.std().round(3).astype(str)
 summary.to_csv("outputs/multiseed_summary.csv")
